@@ -1,3 +1,4 @@
+import gc
 from functools import partial
 import os
 from typing import List, Optional
@@ -33,7 +34,7 @@ try:
     from diffusers.pipelines.ltx2.export_utils import encode_video
     from transformers import (
         Gemma3ForConditionalGeneration,
-        GemmaTokenizerFast,
+        AutoTokenizer,
     )
     from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
     from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
@@ -263,9 +264,12 @@ class LTX2Model(BaseModel):
             )
 
         # if we have a safetensors file it is a mono checkpoint
+        component_dicts = {}
         if os.path.exists(model_path) and model_path.endswith(".safetensors"):
-            combined_state_dict = load_file(model_path)
-            combined_state_dict = dequantize_state_dict(combined_state_dict)
+            raw_state_dict = load_file(model_path)
+            combined_state_dict = dequantize_state_dict(raw_state_dict)
+            raw_state_dict.clear()
+            del raw_state_dict
 
         if combined_state_dict is not None:
             original_dit_ckpt = get_model_state_dict_from_combined_ckpt(
@@ -274,6 +278,30 @@ class LTX2Model(BaseModel):
             transformer = convert_ltx2_transformer(
                 original_dit_ckpt, version=self.ltx_version
             )
+            del original_dit_ckpt
+
+            # Extract other component state dicts now so we can free the
+            # combined dict before loading the text encoder.
+            _connector_prefixes = (
+                "text_embedding_projection",
+                dit_prefix + "video_embeddings_connector",
+                dit_prefix + "audio_embeddings_connector",
+            )
+            for comp_name, comp_prefix, comp_check in [
+                ("vae", vae_prefix, lambda k: k.startswith(vae_prefix)),
+                ("audio_vae", audio_vae_prefix, lambda k: k.startswith(audio_vae_prefix)),
+                ("vocoder", vocoder_prefix, lambda k: k.startswith(vocoder_prefix)),
+                ("connectors", dit_prefix, lambda k: k.startswith(_connector_prefixes)),
+            ]:
+                if any(comp_check(k) for k in combined_state_dict):
+                    component_dicts[comp_name] = get_model_state_dict_from_combined_ckpt(
+                        combined_state_dict, comp_prefix
+                    )
+            del combined_state_dict
+            combined_state_dict = None
+            gc.collect()
+            flush()
+
             transformer = transformer.to(dtype)
         else:
             transformer_path = model_path
@@ -320,6 +348,7 @@ class LTX2Model(BaseModel):
             transformer.to("cpu")
 
         flush()
+        gc.collect()
 
         self.print_and_status_update("Loading text encoder")
         if (
@@ -327,7 +356,7 @@ class LTX2Model(BaseModel):
             and self.model_config.te_name_or_path.endswith(".safetensors")
         ):
             # load from comfyui gemma3 checkpoint
-            tokenizer = GemmaTokenizerFast.from_pretrained(base_te_path)
+            tokenizer = AutoTokenizer.from_pretrained(base_te_path)
 
             with init_empty_weights():
                 text_encoder = Gemma3ForConditionalGeneration(
@@ -390,17 +419,33 @@ class LTX2Model(BaseModel):
                         }
                     )
                 )
-            te_state_dict = load_file(self.model_config.te_name_or_path)
-            te_state_dict = convert_comfy_gemma3_to_transformers(te_state_dict)
+            te_raw = load_file(self.model_config.te_name_or_path)
+            te_state_dict = convert_comfy_gemma3_to_transformers(te_raw)
+            del te_raw
+            gc.collect()
             for key in te_state_dict:
                 te_state_dict[key] = te_state_dict[key].to(dtype)
+
+            # Handle vision tower key layout differences across transformers versions.
+            # Older transformers: model.vision_tower.vision_model.embeddings.*
+            # Newer transformers (>=5.9): model.vision_tower.embeddings.*
+            # The converter always produces the nested form; remap if the model expects flat.
+            model_keys = set(text_encoder.state_dict().keys())
+            nested_prefix = ".vision_tower.vision_model."
+            flat_prefix = ".vision_tower."
+            if (any(nested_prefix in k for k in te_state_dict)
+                    and not any(nested_prefix in k for k in model_keys)):
+                te_state_dict = {
+                    k.replace(nested_prefix, flat_prefix): v
+                    for k, v in te_state_dict.items()
+                }
 
             text_encoder.load_state_dict(te_state_dict, assign=True, strict=True)
             del te_state_dict
             flush()
         elif self.model_config.te_name_or_path is not None:
             # a repo or folder
-            tokenizer = GemmaTokenizerFast.from_pretrained(
+            tokenizer = AutoTokenizer.from_pretrained(
                 self.model_config.te_name_or_path
             )
             text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
@@ -408,13 +453,13 @@ class LTX2Model(BaseModel):
             )
         elif self.ltx_te_path is not None:
             # pull from model specific te
-            tokenizer = GemmaTokenizerFast.from_pretrained(self.ltx_te_path)
+            tokenizer = AutoTokenizer.from_pretrained(self.ltx_te_path)
             text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
                 self.ltx_te_path, dtype=dtype
             )
         else:
             # using combo hf repo
-            tokenizer = GemmaTokenizerFast.from_pretrained(
+            tokenizer = AutoTokenizer.from_pretrained(
                 self.model_config.name_or_path, subfolder="tokenizer"
             )
             text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
@@ -448,56 +493,121 @@ class LTX2Model(BaseModel):
         flush()
 
         self.print_and_status_update("Loading VAEs and other components")
-        if combined_state_dict is not None:
-            original_vae_ckpt = get_model_state_dict_from_combined_ckpt(
-                combined_state_dict, vae_prefix
-            )
+
+        # Helper: load a component from a separate ComfyUI-format safetensors file
+        model_paths = self.model_config.model_paths  # dict from config
+        def _load_component_from_file(file_path, convert_fn, strip_prefix=None):
+            """Load a single-file safetensors component, optionally stripping a key prefix."""
+            sd = load_file(file_path)
+            sd = dequantize_state_dict(sd)
+            if strip_prefix:
+                stripped = {}
+                pfx = strip_prefix if strip_prefix.endswith(".") else strip_prefix + "."
+                for k, v in sd.items():
+                    if k.startswith(pfx):
+                        stripped[k[len(pfx):]] = v
+                    # keys not matching the prefix are dropped
+                sd = stripped
+            return convert_fn(sd, version=self.ltx_version).to(dtype)
+
+        # --- Video VAE ---
+        if "vae" in component_dicts:
             vae = convert_ltx2_video_vae(
-                original_vae_ckpt, version=self.ltx_version
+                component_dicts.pop("vae"), version=self.ltx_version
             ).to(dtype)
-            del original_vae_ckpt
-            original_audio_vae_ckpt = get_model_state_dict_from_combined_ckpt(
-                combined_state_dict, audio_vae_prefix
+        elif "vae" in model_paths:
+            self.print_and_status_update("Loading video VAE from model_paths")
+            vae = _load_component_from_file(
+                model_paths["vae"], convert_ltx2_video_vae
             )
-            audio_vae = convert_ltx2_audio_vae(
-                original_audio_vae_ckpt, version=self.ltx_version
-            ).to(dtype)
-            del original_audio_vae_ckpt
-            original_connectors_ckpt = get_model_state_dict_from_combined_ckpt(
-                combined_state_dict, dit_prefix
-            )
-            connectors = convert_ltx2_connectors(
-                original_connectors_ckpt, version=self.ltx_version
-            ).to(dtype)
-            del original_connectors_ckpt
-            original_vocoder_ckpt = get_model_state_dict_from_combined_ckpt(
-                combined_state_dict, vocoder_prefix
-            )
-            vocoder = convert_ltx2_vocoder(
-                original_vocoder_ckpt, version=self.ltx_version
-            ).to(dtype)
-            del original_vocoder_ckpt
-            del combined_state_dict
-            flush()
         else:
             vae = AutoencoderKLLTX2Video.from_pretrained(
                 base_model_path, subfolder="vae", torch_dtype=dtype
             )
+
+        # --- Audio VAE ---
+        if "audio_vae" in component_dicts:
+            audio_vae = convert_ltx2_audio_vae(
+                component_dicts.pop("audio_vae"), version=self.ltx_version
+            ).to(dtype)
+        elif "audio_vae" in model_paths:
+            self.print_and_status_update("Loading audio VAE from model_paths")
+            audio_vae = _load_component_from_file(
+                model_paths["audio_vae"], convert_ltx2_audio_vae,
+                strip_prefix="audio_vae"
+            )
+        else:
             audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
                 base_model_path, subfolder="audio_vae", torch_dtype=dtype
             )
 
+        # --- Connectors ---
+        # Transformer-only checkpoints contain the connector transformer blocks
+        # but may be missing the aggregate embed projection keys, which live in a
+        # separate file (model_paths["connectors"]).  Merge both when available.
+        if "connectors" in component_dicts:
+            if "connectors" in model_paths:
+                self.print_and_status_update(
+                    "Merging projection keys from model_paths into connectors"
+                )
+                proj_sd = load_file(model_paths["connectors"])
+                proj_sd = dequantize_state_dict(proj_sd)
+                component_dicts["connectors"].update(proj_sd)
+                del proj_sd
+            connectors = convert_ltx2_connectors(
+                component_dicts.pop("connectors"), version=self.ltx_version
+            ).to(dtype)
+        elif "connectors" in model_paths:
+            self.print_and_status_update("Loading connectors from model_paths")
+            connectors = _load_component_from_file(
+                model_paths["connectors"], convert_ltx2_connectors
+            )
+        else:
             connectors = LTX2TextConnectors.from_pretrained(
                 base_model_path, subfolder="connectors", torch_dtype=dtype
             )
 
-            vocoder_cls = LTX2Vocoder
-            if self.ltx_version == "2.3":
-                vocoder_cls = LTX2VocoderWithBWE
-
-            vocoder = vocoder_cls.from_pretrained(
-                base_model_path, subfolder="vocoder", torch_dtype=dtype
+        # --- Vocoder ---
+        # Vocoder is only needed for audio generation/sampling.
+        # For video-only or slider training, it can be None.
+        if "vocoder" in component_dicts:
+            vocoder = convert_ltx2_vocoder(
+                component_dicts.pop("vocoder"), version=self.ltx_version
+            ).to(dtype)
+        elif "vocoder" in model_paths:
+            self.print_and_status_update("Loading vocoder from model_paths")
+            vocoder = _load_component_from_file(
+                model_paths["vocoder"], convert_ltx2_vocoder,
+                strip_prefix="vocoder"
             )
+        elif "audio_vae" in model_paths:
+            # Audio VAE file may also contain bundled vocoder weights
+            try:
+                self.print_and_status_update("Loading vocoder from audio_vae file")
+                vocoder = _load_component_from_file(
+                    model_paths["audio_vae"], convert_ltx2_vocoder,
+                    strip_prefix="vocoder"
+                )
+            except Exception:
+                self.print_and_status_update(
+                    "Warning: No vocoder found in audio_vae file. Audio features will be unavailable."
+                )
+                vocoder = None
+        else:
+            try:
+                vocoder_cls = LTX2Vocoder
+                if self.ltx_version == "2.3":
+                    vocoder_cls = LTX2VocoderWithBWE
+                vocoder = vocoder_cls.from_pretrained(
+                    base_model_path, subfolder="vocoder", torch_dtype=dtype
+                )
+            except (OSError, EnvironmentError):
+                self.print_and_status_update(
+                    "Warning: No vocoder found. Audio features will be unavailable."
+                )
+                vocoder = None
+
+        del component_dicts
 
         self.noise_scheduler = LTX2Model.get_train_scheduler()
 

@@ -44,8 +44,15 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
         },
       });
     } catch (e) {
-      // Process may have already exited — that's fine
-      console.error('Error sending signal to process:', e);
+      // Process may have already exited — mark as stopped anyway
+      console.warn('Process already exited or not found, marking as stopped');
+      await prisma.job.update({
+        where: { id: jobID },
+        data: {
+          status: 'stopped',
+          info: 'Job stopped (process already exited)',
+        },
+      });
     }
   } else {
     console.warn(`No PID found for job ${jobID}, cannot send stop signal`);

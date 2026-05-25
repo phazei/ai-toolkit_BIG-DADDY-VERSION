@@ -899,13 +899,57 @@ def get_model_state_dict_from_combined_ckpt(
     return model_state_dict
 
 
+# NVIDIA FP4 E2M1 format: 4-bit floats with 1 sign, 2 exponent, 1 mantissa bits
+# Nibble values 0x0-0x7 are positive, 0x8-0xF are negative mirrors
+_FP4_E2M1_LUT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.bfloat16,
+)
+
+
+def _dequantize_nvfp4_weight(
+    w_uint8: torch.Tensor,
+    block_scale: torch.Tensor,
+    tensor_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize an NVFP4-packed weight tensor to bfloat16.
+
+    NVFP4 packs two FP4 E2M1 values per uint8 byte (low nibble first).
+    Block scales (float8_e4m3fn) cover fixed-size groups of values.
+    Tensor scale (float32 scalar) is a per-tensor global multiplier.
+
+    result = fp4_lookup[nibble] * block_scale * tensor_scale
+    """
+    # Unpack two 4-bit values from each byte
+    lo = (w_uint8 & 0x0F).to(torch.int64)
+    hi = (w_uint8 >> 4).to(torch.int64)
+    # Interleave: low nibble first, then high nibble (NVFP4 byte order)
+    unpacked = torch.stack([lo, hi], dim=-1).reshape(-1)
+
+    # Map 4-bit indices to FP4 E2M1 float values
+    values = _FP4_E2M1_LUT[unpacked]
+
+    # Apply block scales: each scale covers a fixed group of consecutive values
+    total_values = values.shape[0]
+    total_scales = block_scale.numel()
+    block_size = total_values // total_scales
+    bs_flat = block_scale.to(torch.bfloat16).reshape(-1).repeat_interleave(block_size)
+
+    result = values * bs_flat * tensor_scale.to(torch.bfloat16)
+
+    # Reshape to real weight dimensions (2x columns since 2 values per packed byte)
+    real_shape = (w_uint8.shape[0], w_uint8.shape[1] * 2)
+    return result.reshape(real_shape)
+
+
 def dequantize_state_dict(state_dict: Dict[str, Any]):
     keys = list(state_dict.keys())
     state_out = {}
+    # Collect all scale/meta keys so we can delete them after processing
+    skip_suffixes = (".weight_scale", ".weight_scale_2", ".pre_quant_scale", ".input_scale", ".comfy_quant")
     for k in keys:
-        if k.endswith(
-            (".weight_scale", ".weight_scale_2", ".pre_quant_scale", ".input_scale")
-        ):
+        if k.endswith(skip_suffixes):
             continue
 
         t = state_dict[k]
@@ -913,12 +957,34 @@ def dequantize_state_dict(state_dict: Dict[str, Any]):
         if k.endswith(".weight"):
             prefix = k[: -len(".weight")]
             wscale_k = prefix + ".weight_scale"
+            wscale2_k = prefix + ".weight_scale_2"
+
+            # NVFP4: uint8-packed weights with per-block + per-tensor scales
+            if (
+                wscale_k in state_dict
+                and wscale2_k in state_dict
+                and t.dtype == torch.uint8
+            ):
+                w_bf16 = _dequantize_nvfp4_weight(
+                    t, state_dict[wscale_k], state_dict[wscale2_k]
+                )
+                state_out[k] = w_bf16
+                # Free source tensors to reduce peak memory
+                del state_dict[k]
+                state_dict.pop(wscale_k, None)
+                state_dict.pop(wscale2_k, None)
+                state_dict.pop(prefix + ".comfy_quant", None)
+                continue
+
+            # ComfyUI FP8: per-tensor absmax scalar scale
             if wscale_k in state_dict:
                 w_q = t
                 w_scale = state_dict[wscale_k]
-                # Comfy quant = absmax per-tensor weight quant, nothing fancy
                 w_bf16 = w_q.to(torch.bfloat16) * w_scale.to(torch.bfloat16)
                 state_out[k] = w_bf16
+                # Free source tensors to reduce peak memory
+                del state_dict[k]
+                state_dict.pop(wscale_k, None)
                 continue
 
         state_out[k] = t
@@ -928,7 +994,9 @@ def dequantize_state_dict(state_dict: Dict[str, Any]):
 def convert_comfy_gemma3_to_transformers(sd: dict):
     out = {}
 
-    sd = dequantize_state_dict(sd)
+    sd_deq = dequantize_state_dict(sd)
+    sd.clear()  # free original quantized tensors immediately
+    sd = sd_deq
 
     for k, v in sd.items():
         nk = k
